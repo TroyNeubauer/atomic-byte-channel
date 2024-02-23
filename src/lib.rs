@@ -1,0 +1,292 @@
+//! An async, byte-orented, high-performance, mpmc channel,
+//!
+//! Use cases:
+//! 1. One thread continuously generates IPV4 packets that are sent to multiple worker I/O threads
+//!    for better throughput
+//! 2. Multi threaded linker wants to create two separate sections in the same elf file that can be
+//!    written to in parallel
+
+use std::{
+    cell::UnsafeCell,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
+
+// TODO: switch to our own
+// tokio has a decent one for what we need, so just use that for now
+use crossbeam_channel::{Receiver, Sender};
+use crossbeam_utils::CachePadded;
+pub use tokio::io::ReadBuf;
+
+pub struct Shared {
+    /// Offset of the next available byte for writing, modulo the size of the buffer
+    /// Used for atomically coordinating unique access to parts of the buffer by writers
+    ///
+    // NOTE: this and `tail` are offsets not indices, to prevent the ABA problem.
+    // Take this modulo the buffer's size before accessing anything in the buffer
+    // `head == tail` indicates the k
+    head: CachePadded<AtomicUsize>,
+
+    /// Offset of the oldest element not fully consumed by readers (write limit for ring buffer),
+    /// modulo the size of the buffer
+    tail: CachePadded<AtomicUsize>,
+}
+
+pub fn new(capacity: usize) -> (Writer, Reader) {
+    let v: Vec<UnsafeCell<u8>> = (0..capacity).map(|_| UnsafeCell::new(0u8)).collect();
+    let buf: Arc<[UnsafeCell<u8>]> = v.into_boxed_slice().into();
+
+    let shared = Arc::new(Shared {
+        head: CachePadded::new(AtomicUsize::new(0)),
+        tail: CachePadded::new(AtomicUsize::new(0)),
+    });
+    let (ticket_tx, ticket_rx) = crossbeam_channel::bounded(8);
+
+    (
+        Writer {
+            buf: Arc::clone(&buf),
+            shared: Arc::clone(&shared),
+            ticket_tx,
+        },
+        Reader {
+            buf,
+            shared,
+            ticket_rx,
+        },
+    )
+}
+
+#[derive(Clone)]
+pub struct Writer {
+    // TODO: bench perf of making uninitialized and compare to now
+    buf: Arc<[UnsafeCell<u8>]>,
+    shared: Arc<Shared>,
+    ticket_tx: Sender<FinalizedTicket>,
+}
+
+impl Writer {
+    /// Tries to reserve a
+    pub fn try_reserve<'a>(&'a self, len: usize) -> Option<Ticket<'a>> {
+        let head = self.shared.head.load(Ordering::Acquire);
+        let tail = self.shared.tail.load(Ordering::Acquire);
+        dbg!(len, head, tail);
+
+        // Ensure new head doesnt step on the reader's tail
+        let bytes_used = head - tail;
+        let bytes_remaining = self.buf.len() - bytes_used;
+        dbg!(bytes_used, bytes_remaining);
+        if len >= bytes_remaining {
+            // Use >= to always keep one byte free for distinguishing empty from full
+            println!("Ring buffer full");
+            return None;
+        }
+
+        // NOTE: we cant use `fetch_add`, since we need to prevent wraparound
+        let offset = self
+            .shared
+            .head
+            .compare_exchange(head, head + len, Ordering::AcqRel, Ordering::Relaxed)
+            .unwrap();
+        let start = self.buf[self.index(offset)].get();
+
+        // SAFETY:
+        // 1. Readers never read bytes
+        // 2. We exchanged `head` with `new_head` atomically, giving unique access to `len` bytes
+        //    starting at `offest`
+        let buf = unsafe { std::slice::from_raw_parts_mut(start, len) };
+
+        Some(Ticket {
+            buf: ReadBuf::new(buf),
+            offset,
+        })
+    }
+
+    pub fn finalize_ticket<'a>(&'a self, ticket: Ticket<'a>) -> Result<(), Ticket<'a>> {
+        let filled = ticket.buf.filled().len();
+        let capacity = ticket.buf.capacity();
+        // TODO: do we want to support the user changing the length?
+        if filled != capacity {
+            panic!("Ticket not completely filled with data! Reserved {capacity} bytes, but user only wrote {filled} bytes");
+        }
+
+        self.ticket_tx
+            .try_send(FinalizedTicket {
+                offset: ticket.offset,
+                len: ticket.buf.capacity(),
+            })
+            .map_err(|_| ticket)
+    }
+
+    pub(crate) fn index(&self, offset: usize) -> usize {
+        offset % self.buf.len()
+    }
+}
+
+#[derive(Clone)]
+pub struct Reader {
+    buf: Arc<[UnsafeCell<u8>]>,
+    shared: Arc<Shared>,
+    ticket_rx: Receiver<FinalizedTicket>,
+}
+
+impl Reader {
+    pub fn try_recv<'a>(&'a self) -> Result<PacketHandle<'a>, ()> {
+        Ok(self.handle_recv(self.ticket_rx.try_recv().map_err(|_| ())?))
+    }
+
+    pub(crate) fn handle_recv<'a>(&'a self, ticket: FinalizedTicket) -> PacketHandle<'a> {
+        println!("Reader got ticket: {ticket:?}");
+
+        // TODO: incrementing tail and then referencing the memory there is memory unsafe.
+        // Make wrapper type like Ticket, but for completed writes, and only advance tail once that
+        // is dropped
+        let index = self.index(ticket.offset);
+        let start: *const u8 = self.buf[index].get();
+
+        // SAFETY: We have received a finalized ticket from a writer, indicating that we have
+        // exclusive access to the range ticket.offset..(ticket.offset + ticket.len)
+        let buf = unsafe { std::slice::from_raw_parts(start, ticket.len) };
+        PacketHandle {
+            buf,
+            ticket,
+            reader: self,
+        }
+    }
+
+    pub(crate) fn cleanup_handle<'a>(&'a self, handle: &mut PacketHandle<'a>) {
+        let ticket = &handle.ticket;
+        // Increment tail to unblock readers
+
+        // New tail index (if we just received the oldest ticket)
+        let new_tail = ticket.offset + ticket.len;
+        // TODO: handle case where reserved size is too big and wraparound occurs, causing spacing
+        // at the end of the buffer between packets
+        match self.shared.tail.compare_exchange(
+            ticket.offset,
+            new_tail,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                println!(
+                    "Reader incremented tail for section {}..{new_tail}",
+                    ticket.offset
+                );
+            }
+            Err(actual) => {
+                // Akward, this ticket was submitted out of order with respect to reserving memory,
+                // we still need to increment tail later (so the reader can re-use this memory)
+                panic!("Reader failed to increment tail after ticket recv. Read section {}..{new_tail}, but tail was actually {actual}", ticket.offset)
+            }
+        }
+    }
+
+    pub(crate) fn index(&self, offset: usize) -> usize {
+        offset % self.buf.len()
+    }
+
+    pub fn iter<'a>(&'a self) -> ReaderIterator<'a> {
+        ReaderIterator { reader: self }
+    }
+}
+
+pub struct PacketHandle<'a> {
+    buf: &'a [u8],
+    ticket: FinalizedTicket,
+    reader: &'a Reader,
+}
+
+impl PacketHandle<'_> {
+    pub fn bytes(&self) -> &[u8] {
+        self.buf
+    }
+}
+
+impl<'a> std::ops::Deref for PacketHandle<'a> {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.buf
+    }
+}
+
+impl Drop for PacketHandle<'_> {
+    fn drop(&mut self) {
+        self.reader.cleanup_handle(self);
+    }
+}
+
+pub struct ReaderIterator<'a> {
+    reader: &'a Reader,
+}
+
+impl<'a> Iterator for ReaderIterator<'a> {
+    type Item = PacketHandle<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let ticket = self.reader.ticket_rx.recv().ok()?;
+        Some(self.reader.handle_recv(ticket))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FinalizedTicket {
+    /// The (non-wrapping) index this ticket starts at
+    offset: usize,
+    len: usize,
+}
+
+#[derive(Debug)]
+pub struct Ticket<'a> {
+    buf: ReadBuf<'a>,
+    /// The (non-wrapping) index this ticket starts at
+    offset: usize,
+}
+
+impl<'a> std::ops::Deref for Ticket<'a> {
+    type Target = ReadBuf<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.buf
+    }
+}
+
+impl<'a> std::ops::DerefMut for Ticket<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.buf
+    }
+}
+
+// TLDR: How to make mpmc work efficiently
+//
+// The secret sauce of this crate is that writers can call reserve in parallel, and receive a
+// mutable slice in the ring buffer that they can write to directly into (via a ticket).
+// Because these slices are non-overlapping, and because the readers can't read them, the writers
+// are able to write in parallel.
+//
+// The issue comes when writers finish with their ticket in different orders than they requested
+// them.
+//
+// Image the following scenario:
+// Two writers call `try_reserve` around the same time and both succeed. They begin writing their
+// data to the ring buffer:
+//                 Writer A | Writer B | No active tickets
+// Ring buffer: [ XXX.......|XXXX......|............... ]
+// Until the writers complete their tickets, any reader's pointer will stay at zero, and readers will
+// be unable to read the data until finalized.
+//
+// Now Writer B finishes writing its data and sends the ticket:
+//                 Writer A | Writer B | No active tickets
+// Ring buffer: [ XXXXX.....|XXXXXXXXXX|............... ]
+// Like a normal ring buffer, we advance the write pointer when data is finished being written.
+// If we naively do this in the situation presented above, the readers will break aliasing rules by
+// reading Writer A's partially complete write.
+//
+// We could use a channel to get around this, by sending the finished range to readers, and only
+// using the ring buffer's points for allocating chunks in `try_reserve` and keeping the readers
+// separate from the writers, but this feels unsatisfying.
+//
+// EDIT: I will do the channel implementation first since its simpler, then bench / evaluate
+// against a more proper implementation once I can solve this problem.
