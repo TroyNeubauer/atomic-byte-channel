@@ -19,7 +19,7 @@ fn recv_out_of_order() {
     let chunk_len = 128;
     let (w, r) = atomic_byte_channel::new(chunk_len * 8);
 
-    let bytes_of_bytes: Vec<Vec<u8>> = (0..2)
+    let bytes_of_bytes: Vec<Vec<u8>> = (0..7)
         .map(|i| (0u8..chunk_len as u8).map(|v| v.wrapping_add(i)).collect())
         .collect();
 
@@ -40,7 +40,8 @@ fn recv_out_of_order() {
     }
 
     for (bytes2, bytes) in bytes_of_bytes.iter().rev().zip(r.iter()) {
-        //assert_eq!(bytes, bytes2);
+        println!();
+        assert_eq!(bytes.bytes(), bytes2);
     }
 }
 

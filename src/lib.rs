@@ -8,8 +8,9 @@
 
 use std::{
     cell::UnsafeCell,
+    collections::VecDeque,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -18,6 +19,7 @@ use std::{
 // tokio has a decent one for what we need, so just use that for now
 use crossbeam_channel::{Receiver, Sender};
 use crossbeam_utils::CachePadded;
+use parking_lot::Mutex;
 pub use tokio::io::ReadBuf;
 
 pub struct Shared {
@@ -26,7 +28,7 @@ pub struct Shared {
     ///
     // NOTE: this and `tail` are offsets not indices, to prevent the ABA problem.
     // Take this modulo the buffer's size before accessing anything in the buffer
-    // `head == tail` indicates the k
+    // `head == tail` indicates that the buffer is empty, as we always leave at least one byte open
     head: CachePadded<AtomicUsize>,
 
     /// Offset of the oldest element not fully consumed by readers (write limit for ring buffer),
@@ -54,6 +56,8 @@ pub fn new(capacity: usize) -> (Writer, Reader) {
             buf,
             shared,
             ticket_rx,
+            pending_handles: Arc::new(Mutex::new(VecDeque::new())),
+            pending_empty: Arc::new(AtomicBool::new(true)),
         },
     )
 }
@@ -71,12 +75,11 @@ impl Writer {
     pub fn try_reserve<'a>(&'a self, len: usize) -> Option<Ticket<'a>> {
         let head = self.shared.head.load(Ordering::Acquire);
         let tail = self.shared.tail.load(Ordering::Acquire);
-        dbg!(len, head, tail);
+        // TODO: ensure we can find `len` continuous bytes
 
         // Ensure new head doesnt step on the reader's tail
         let bytes_used = head - tail;
         let bytes_remaining = self.buf.len() - bytes_used;
-        dbg!(bytes_used, bytes_remaining);
         if len >= bytes_remaining {
             // Use >= to always keep one byte free for distinguishing empty from full
             println!("Ring buffer full");
@@ -84,6 +87,7 @@ impl Writer {
         }
 
         // NOTE: we cant use `fetch_add`, since we need to prevent wraparound
+        // TODO: handle contention
         let offset = self
             .shared
             .head
@@ -129,6 +133,11 @@ pub struct Reader {
     buf: Arc<[UnsafeCell<u8>]>,
     shared: Arc<Shared>,
     ticket_rx: Receiver<FinalizedTicket>,
+    /// Handles that have been dropped, but cant be handled since they were received out of order
+    pending_handles: Arc<Mutex<VecDeque<FinalizedTicket>>>,
+    // `pending_handles.is_empty()` in an atomic (best effort)
+    pending_empty: Arc<AtomicBool>,
+    // TODO: add atomic bool for flagging that no handles are pending (no re-order needed)
 }
 
 impl Reader {
@@ -137,11 +146,9 @@ impl Reader {
     }
 
     pub(crate) fn handle_recv<'a>(&'a self, ticket: FinalizedTicket) -> PacketHandle<'a> {
+        self.try_run_cleanup();
         println!("Reader got ticket: {ticket:?}");
 
-        // TODO: incrementing tail and then referencing the memory there is memory unsafe.
-        // Make wrapper type like Ticket, but for completed writes, and only advance tail once that
-        // is dropped
         let index = self.index(ticket.offset);
         let start: *const u8 = self.buf[index].get();
 
@@ -155,30 +162,78 @@ impl Reader {
         }
     }
 
-    pub(crate) fn cleanup_handle<'a>(&'a self, handle: &mut PacketHandle<'a>) {
-        let ticket = &handle.ticket;
-        // Increment tail to unblock readers
+    pub(crate) fn try_run_cleanup(&self) {
+        if self.pending_empty.load(Ordering::Acquire) {
+            return;
+        }
 
-        // New tail index (if we just received the oldest ticket)
-        let new_tail = ticket.offset + ticket.len;
-        // TODO: handle case where reserved size is too big and wraparound occurs, causing spacing
-        // at the end of the buffer between packets
-        match self.shared.tail.compare_exchange(
-            ticket.offset,
-            new_tail,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => {
-                println!(
-                    "Reader incremented tail for section {}..{new_tail}",
-                    ticket.offset
-                );
+        if let Some(mut pending) = self.pending_handles.try_lock() {
+            println!("{} tickets remain unhandled", pending.len());
+            // Tickets sorted, so if we are unable to cleanup one, we will be unable to cleanup
+            // anything after it
+            while let Some(ticket) = pending.front() {
+                match self.try_cleanup_ticket(ticket, false) {
+                    Ok(()) => pending.pop_front(),
+                    Err(()) => break,
+                };
             }
-            Err(actual) => {
-                // Akward, this ticket was submitted out of order with respect to reserving memory,
-                // we still need to increment tail later (so the reader can re-use this memory)
-                panic!("Reader failed to increment tail after ticket recv. Read section {}..{new_tail}, but tail was actually {actual}", ticket.offset)
+            self.pending_empty
+                .store(pending.is_empty(), Ordering::Release);
+        }
+    }
+
+    pub(crate) fn try_cleanup_ticket<'a>(
+        &'a self,
+        ticket: &FinalizedTicket,
+        add_if_pending: bool,
+    ) -> Result<(), ()> {
+        let tail = self.shared.tail.load(Ordering::Acquire);
+
+        println!("Trying to cleanup {ticket:?}");
+        if ticket.offset > tail {
+            if add_if_pending {
+                // Awkward, this ticket was submitted out of order with respect to reserving memory,
+                // Add to pending list and handle later, once tickets coming before this one are cleaned up
+                let mut pending = self.pending_handles.lock();
+                // keep `pending_handles` sorted by their offset fields, since we need to perform
+                // cleanup in order
+                let insert_index = match pending.binary_search_by(|e| e.offset.cmp(&ticket.offset))
+                {
+                    Ok(i) => i,
+                    Err(i) => i,
+                };
+                pending.insert(insert_index, ticket.clone());
+                self.pending_empty
+                    .store(pending.is_empty(), Ordering::Release);
+                dbg!(&pending);
+                println!("Cant handle ticket currently. Cleaning {ticket:?} later tail: {tail}");
+            }
+            return Err(());
+        }
+
+        loop {
+            // New tail index (if we just received the oldest ticket)
+            let new_tail = ticket.offset + ticket.len;
+            // TODO: handle case where reserved size is too big and wraparound occurs, causing
+            // spacing at the end of the buffer between packets
+
+            match self.shared.tail.compare_exchange(
+                ticket.offset,
+                new_tail,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    println!("Handled ticket {ticket:?}");
+                    break Ok(());
+                }
+                Err(actual_tail) => {
+                    // Either:
+                    // ticket.offset > tail (handled above)
+                    // ticket.offset == tail, leads to Ok branch
+                    // Nobody else can increment tail if tail equals our ticket's offset
+                    unreachable!("Reader failed to increment tail after ticket recv. Read section {}..{new_tail}, but tail was actually {actual_tail}", ticket.offset)
+                }
             }
         }
     }
@@ -189,6 +244,12 @@ impl Reader {
 
     pub fn iter<'a>(&'a self) -> ReaderIterator<'a> {
         ReaderIterator { reader: self }
+    }
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.try_run_cleanup();
     }
 }
 
@@ -214,7 +275,7 @@ impl<'a> std::ops::Deref for PacketHandle<'a> {
 
 impl Drop for PacketHandle<'_> {
     fn drop(&mut self) {
-        self.reader.cleanup_handle(self);
+        let _ = self.reader.try_cleanup_ticket(&self.ticket, true);
     }
 }
 
@@ -289,4 +350,7 @@ impl<'a> std::ops::DerefMut for Ticket<'a> {
 // separate from the writers, but this feels unsatisfying.
 //
 // EDIT: I will do the channel implementation first since its simpler, then bench / evaluate
-// against a more proper implementation once I can solve this problem.
+// against a more proper implementation once I can solve this problem. The channel solution also
+// has a similar problem when packets are finished being read in a different out of order. We have
+// to maintain a list of pending packets that will be handled once packets before it are finished
+// being read
