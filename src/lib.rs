@@ -62,6 +62,9 @@ pub fn new(capacity: usize) -> (Writer, Reader) {
     )
 }
 
+unsafe impl Send for Writer {}
+unsafe impl Sync for Writer {}
+
 #[derive(Clone)]
 pub struct Writer {
     // TODO: bench perf of making uninitialized and compare to now
@@ -70,41 +73,64 @@ pub struct Writer {
     ticket_tx: Sender<FinalizedTicket>,
 }
 
+/// Returns `n` rounded up to the nearest multiple of `base`.
+/// If `n` is already a multiple of `base`, `n` is unchanged
+fn next_mutiple(n: usize, base: usize) -> usize {
+    let one_minus_base = base - 1;
+    (n + one_minus_base) / base * base
+}
+
 impl Writer {
     /// Tries to reserve a
     pub fn try_reserve<'a>(&'a self, len: usize) -> Option<Ticket<'a>> {
-        let head = self.shared.head.load(Ordering::Acquire);
-        let tail = self.shared.tail.load(Ordering::Acquire);
-        // TODO: ensure we can find `len` continuous bytes
+        let mut head = self.shared.head.load(Ordering::Acquire);
+        loop {
+            let tail = self.shared.tail.load(Ordering::Acquire);
+            // TODO: ensure we can find `len` continuous bytes
 
-        // Ensure new head doesnt step on the reader's tail
-        let bytes_used = head - tail;
-        let bytes_remaining = self.buf.len() - bytes_used;
-        if len >= bytes_remaining {
-            // Use >= to always keep one byte free for distinguishing empty from full
-            println!("Ring buffer full");
-            return None;
+            // Ensure new head doesnt step on the reader's tail
+            let bytes_used = head - tail;
+            let bytes_remaining = self.buf.len() - bytes_used;
+            if len >= bytes_remaining {
+                // Use >= to always keep one byte free for distinguishing empty from full
+                return None;
+            }
+
+            let start_index = self.index(head);
+            let mut new_head = head + len;
+            if start_index + len > self.buf.len() {
+                dbg!(start_index, head, self.buf.len());
+                // prevent wraparound since we must give contiguous memory out
+                new_head = next_mutiple(head, self.buf.len()) + len;
+            }
+
+            // NOTE: we cant use `fetch_add`, since we need to prevent wraparound
+            let offset = match self.shared.head.compare_exchange(
+                head,
+                new_head,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(offset) => offset,
+                Err(new_head) => {
+                    head = new_head;
+                    continue;
+                }
+            };
+
+            let start = self.buf[self.index(offset)].get();
+
+            // SAFETY:
+            // 1. Readers never read bytes
+            // 2. We exchanged `head` with `new_head` atomically, giving unique access to `len` bytes
+            //    starting at `offest`
+            let buf = unsafe { std::slice::from_raw_parts_mut(start, len) };
+
+            break Some(Ticket {
+                buf: ReadBuf::new(buf),
+                offset,
+            });
         }
-
-        // NOTE: we cant use `fetch_add`, since we need to prevent wraparound
-        // TODO: handle contention
-        let offset = self
-            .shared
-            .head
-            .compare_exchange(head, head + len, Ordering::AcqRel, Ordering::Relaxed)
-            .unwrap();
-        let start = self.buf[self.index(offset)].get();
-
-        // SAFETY:
-        // 1. Readers never read bytes
-        // 2. We exchanged `head` with `new_head` atomically, giving unique access to `len` bytes
-        //    starting at `offest`
-        let buf = unsafe { std::slice::from_raw_parts_mut(start, len) };
-
-        Some(Ticket {
-            buf: ReadBuf::new(buf),
-            offset,
-        })
     }
 
     pub fn finalize_ticket<'a>(&'a self, ticket: Ticket<'a>) -> Result<(), Ticket<'a>> {
@@ -127,6 +153,9 @@ impl Writer {
         offset % self.buf.len()
     }
 }
+
+unsafe impl Send for Reader {}
+unsafe impl Sync for Reader {}
 
 #[derive(Clone)]
 pub struct Reader {
