@@ -6,14 +6,53 @@
 //! 2. Multi threaded linker wants to create two separate sections in the same elf file that can be
 //!    written to in parallel
 
-use std::{
-    cell::UnsafeCell,
-    collections::VecDeque,
-    sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
-    },
-};
+#[cfg(not(features = "std"))]
+extern crate alloc;
+
+pub mod prelude {
+    pub(crate) use core::{
+        cell::UnsafeCell,
+        fmt::{self, Debug},
+        future::Future,
+        mem::MaybeUninit,
+        pin::Pin,
+        ptr,
+        sync::atomic::Ordering,
+        task::{Context, Poll, Waker},
+    };
+    pub(crate) use futures_core::ready;
+
+    #[cfg(loom)]
+    pub(crate) mod atomic {
+        pub(crate) use atomic_waker::AtomicWaker;
+        pub(crate) use loom::sync::atomic::{fence, AtomicBool, AtomicU8, AtomicUsize};
+    }
+
+    #[cfg(not(loom))]
+    pub(crate) mod atomic {
+        #[cfg(not(feature = "std"))]
+        pub use alloc::vec::Vec;
+        #[cfg(feature = "std")]
+        pub use std::vec::Vec;
+
+        pub(crate) use atomic_waker::AtomicWaker;
+        pub(crate) use core::sync::atomic::{fence, AtomicBool, AtomicU8, AtomicUsize};
+    }
+
+    // Use std'd Arc even when under loom
+    #[cfg(not(feature = "std"))]
+    pub use alloc::sync::Arc;
+    #[cfg(feature = "std")]
+    pub use std::sync::Arc;
+
+    pub(crate) use atomic::*;
+
+    pub use super::{new, Reader, Writer};
+}
+
+use prelude::*;
+
+use std::collections::VecDeque;
 
 // TODO: switch to our own
 // tokio has a decent one for what we need, so just use that for now
@@ -37,14 +76,20 @@ pub struct Shared {
 }
 
 pub fn new(capacity: usize) -> (Writer, Reader) {
+    new_with_packet_estimate(capacity, 16)
+}
+
+pub fn new_with_packet_estimate(capacity: usize, average_packet_size: usize) -> (Writer, Reader) {
     let v: Vec<UnsafeCell<u8>> = (0..capacity).map(|_| UnsafeCell::new(0u8)).collect();
+
     let buf: Arc<[UnsafeCell<u8>]> = v.into_boxed_slice().into();
 
     let shared = Arc::new(Shared {
         head: CachePadded::new(AtomicUsize::new(0)),
         tail: CachePadded::new(AtomicUsize::new(0)),
     });
-    let (ticket_tx, ticket_rx) = crossbeam_channel::bounded(8);
+    let max_packets_in_flight = capacity / average_packet_size;
+    let (ticket_tx, ticket_rx) = crossbeam_channel::bounded(max_packets_in_flight);
 
     (
         Writer {
@@ -80,32 +125,59 @@ fn next_mutiple(n: usize, base: usize) -> usize {
     (n + one_minus_base) / base * base
 }
 
+// After try_reserve(8) #1:
+// len: 17
+// Head [        |        ] 8
+// Tail [|                ] 0
+//
+// After try_reserve(8) #2:
+// Head [                |] 16
+// Tail [|                ] 0
+//
+// After reader handles ticket(8) #1:
+// Head [                |] 16
+// Tail [        |        ] 0
+//
+// After reader handles ticket(8) #2:
+// Head [                |] 16
+// Tail [                |] 0
+
 impl Writer {
     /// Tries to reserve a
     pub fn try_reserve<'a>(&'a self, len: usize) -> Option<Ticket<'a>> {
         let mut head = self.shared.head.load(Ordering::Acquire);
         loop {
             let tail = self.shared.tail.load(Ordering::Acquire);
-            // TODO: ensure we can find `len` continuous bytes
 
-            // Ensure new head doesnt step on the reader's tail
-            let bytes_used = head - tail;
-            let bytes_remaining = self.buf.len() - bytes_used;
-            if len >= bytes_remaining {
-                // Use >= to always keep one byte free for distinguishing empty from full
-                return None;
+            // Wraparound to front of buffer we don't have `len` bytes before the end of the buffer
+            let wraparound = self.index(head) + len > self.buf.len();
+
+            //println!("try_reserve: head: {head}, tail: {tail}, len: {len}");
+            if wraparound {
+                // don't step on reader(s)
+                if len > self.index(tail) {
+                    // Not enough space at front of buffer
+                    //println!("Not enough space at front of buffer");
+                    return None;
+                }
+                //println!("using wraparound");
+            } else {
+                // don't step on reader(s)
+                let end = head + len;
+                if end > tail + self.buf.len() {
+                    //println!("Allocate wouldn't fit (without wraparound)");
+                    return None;
+                }
             }
 
-            let start_index = self.index(head);
-            let mut new_head = head + len;
-            if start_index + len > self.buf.len() {
-                dbg!(start_index, head, self.buf.len());
-                // prevent wraparound since we must give contiguous memory out
-                new_head = next_mutiple(head, self.buf.len()) + len;
-            }
+            let new_head = if wraparound {
+                next_mutiple(head, self.buf.len()) + len
+            } else {
+                head + len
+            };
 
             // NOTE: we cant use `fetch_add`, since we need to prevent wraparound
-            let offset = match self.shared.head.compare_exchange(
+            let offset = match self.shared.head.compare_exchange_weak(
                 head,
                 new_head,
                 Ordering::AcqRel,
@@ -118,7 +190,14 @@ impl Writer {
                 }
             };
 
-            let start = self.buf[self.index(offset)].get();
+            let idx = self.index(new_head - len);
+            //println!(
+            //   "try_reserve: head {offset} -> {new_head}, making indices {}..{} available to writer",
+            //   idx,
+            //   idx + len
+            //);
+
+            let start = self.buf[idx].get();
 
             // SAFETY:
             // 1. Readers never read bytes
@@ -128,7 +207,8 @@ impl Writer {
 
             break Some(Ticket {
                 buf: ReadBuf::new(buf),
-                offset,
+                alloc_start: offset,
+                alloc_end: new_head,
             });
         }
     }
@@ -141,10 +221,12 @@ impl Writer {
             panic!("Ticket not completely filled with data! Reserved {capacity} bytes, but user only wrote {filled} bytes");
         }
 
+        //println!("Buffered tickets: {}", self.ticket_tx.len());
         self.ticket_tx
             .try_send(FinalizedTicket {
-                offset: ticket.offset,
+                alloc_start: ticket.alloc_start,
                 len: ticket.buf.capacity(),
+                alloc_end: ticket.alloc_end,
             })
             .map_err(|_| ticket)
     }
@@ -176,10 +258,15 @@ impl Reader {
 
     pub(crate) fn handle_recv<'a>(&'a self, ticket: FinalizedTicket) -> PacketHandle<'a> {
         self.try_run_cleanup();
-        println!("Reader got ticket: {ticket:?}");
 
-        let index = self.index(ticket.offset);
-        let start: *const u8 = self.buf[index].get();
+        let wraparound = ticket.alloc_end - ticket.len != ticket.alloc_start;
+        let idx = if wraparound {
+            debug_assert!(self.index(ticket.alloc_end) == ticket.len);
+            0
+        } else {
+            self.index(ticket.alloc_end - ticket.len)
+        };
+        let start: *const u8 = self.buf[idx].get();
 
         // SAFETY: We have received a finalized ticket from a writer, indicating that we have
         // exclusive access to the range ticket.offset..(ticket.offset + ticket.len)
@@ -197,11 +284,12 @@ impl Reader {
         }
 
         if let Some(mut pending) = self.pending_handles.try_lock() {
-            println!("{} tickets remain unhandled", pending.len());
+            //println!("{} tickets remain unhandled", pending.len());
+
             // Tickets sorted, so if we are unable to cleanup one, we will be unable to cleanup
             // anything after it
             while let Some(ticket) = pending.front() {
-                match self.try_cleanup_ticket(ticket, false) {
+                match self.try_cleanup_ticket(ticket) {
                     Ok(()) => pending.pop_front(),
                     Err(()) => break,
                 };
@@ -211,49 +299,43 @@ impl Reader {
         }
     }
 
-    pub(crate) fn try_cleanup_ticket<'a>(
-        &'a self,
-        ticket: &FinalizedTicket,
-        add_if_pending: bool,
-    ) -> Result<(), ()> {
+    pub(crate) fn add_to_pending_list(&self, ticket: FinalizedTicket) {
+        // Awkward, this ticket was submitted out of order with respect to reserving memory,
+        // Add to pending list and handle later, once tickets coming before this one are cleaned up
+        let mut pending = self.pending_handles.lock();
+        // keep `pending_handles` sorted by their offset fields, since we need to perform
+        // cleanup in order
+        let insert_index =
+            match pending.binary_search_by(|e| e.alloc_start.cmp(&ticket.alloc_start)) {
+                Ok(i) => i,
+                Err(i) => i,
+            };
+
+        pending.insert(insert_index, ticket.clone());
+        self.pending_empty.store(false, Ordering::Release);
+        //println!("Cant handle ticket currently. Cleaning {ticket:?} later tail: {tail}, pending: {pending:?}");
+    }
+
+    pub(crate) fn try_cleanup_ticket<'a>(&'a self, ticket: &FinalizedTicket) -> Result<(), ()> {
         let tail = self.shared.tail.load(Ordering::Acquire);
 
-        println!("Trying to cleanup {ticket:?}");
-        if ticket.offset > tail {
-            if add_if_pending {
-                // Awkward, this ticket was submitted out of order with respect to reserving memory,
-                // Add to pending list and handle later, once tickets coming before this one are cleaned up
-                let mut pending = self.pending_handles.lock();
-                // keep `pending_handles` sorted by their offset fields, since we need to perform
-                // cleanup in order
-                let insert_index = match pending.binary_search_by(|e| e.offset.cmp(&ticket.offset))
-                {
-                    Ok(i) => i,
-                    Err(i) => i,
-                };
-                pending.insert(insert_index, ticket.clone());
-                self.pending_empty
-                    .store(pending.is_empty(), Ordering::Release);
-                dbg!(&pending);
-                println!("Cant handle ticket currently. Cleaning {ticket:?} later tail: {tail}");
-            }
+        //println!("Reader trying to cleanup {ticket:?}");
+        if ticket.alloc_start > tail {
             return Err(());
         }
 
         loop {
-            // New tail index (if we just received the oldest ticket)
-            let new_tail = ticket.offset + ticket.len;
-            // TODO: handle case where reserved size is too big and wraparound occurs, causing
-            // spacing at the end of the buffer between packets
-
-            match self.shared.tail.compare_exchange(
-                ticket.offset,
-                new_tail,
+            match self.shared.tail.compare_exchange_weak(
+                ticket.alloc_start,
+                ticket.alloc_end,
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    println!("Handled ticket {ticket:?}");
+                    //println!(
+                    //    "Reader handled ticket {ticket:?}, tail: {} -> {}",
+                    //    ticket.alloc_start, ticket.alloc_end
+                    //);
                     break Ok(());
                 }
                 Err(actual_tail) => {
@@ -261,7 +343,7 @@ impl Reader {
                     // ticket.offset > tail (handled above)
                     // ticket.offset == tail, leads to Ok branch
                     // Nobody else can increment tail if tail equals our ticket's offset
-                    unreachable!("Reader failed to increment tail after ticket recv. Read section {}..{new_tail}, but tail was actually {actual_tail}", ticket.offset)
+                    unreachable!("Reader failed to increment tail after ticket recv. Read section {}..{}, but tail was actually {actual_tail}", ticket.alloc_start, ticket.alloc_end)
                 }
             }
         }
@@ -304,7 +386,9 @@ impl<'a> std::ops::Deref for PacketHandle<'a> {
 
 impl Drop for PacketHandle<'_> {
     fn drop(&mut self) {
-        let _ = self.reader.try_cleanup_ticket(&self.ticket, true);
+        if self.reader.try_cleanup_ticket(&self.ticket).is_err() {
+            self.reader.add_to_pending_list(self.ticket.clone());
+        }
     }
 }
 
@@ -323,16 +407,23 @@ impl<'a> Iterator for ReaderIterator<'a> {
 
 #[derive(Clone, Debug)]
 struct FinalizedTicket {
-    /// The (non-wrapping) index this ticket starts at
-    offset: usize,
+    alloc_start: usize,
+    /// The (non-wrapping) location this allocation ends at
+    /// NOTE: May be more than `offset_start + len` to handle wraparound
+    /// NOTE: The user's data _always_ starts at `alloc_end` - len. When wraparound occurs,
+    /// The user's first byte will be at `buf[0]`, therefore: `self.index(alloc_end) == len`
+    alloc_end: usize,
     len: usize,
 }
 
 #[derive(Debug)]
 pub struct Ticket<'a> {
     buf: ReadBuf<'a>,
-    /// The (non-wrapping) index this ticket starts at
-    offset: usize,
+    /// The (non-wrapping) location this ticket starts at
+    alloc_start: usize,
+    /// The (non-wrapping) location this ticket ends at
+    /// NOTE: may be more than `offset_start + len` to handle wraparound
+    alloc_end: usize,
 }
 
 impl<'a> std::ops::Deref for Ticket<'a> {
@@ -362,24 +453,36 @@ impl<'a> std::ops::DerefMut for Ticket<'a> {
 // Image the following scenario:
 // Two writers call `try_reserve` around the same time and both succeed. They begin writing their
 // data to the ring buffer:
-//                 Writer A | Writer B | No active tickets
-// Ring buffer: [ XXX.......|XXXX......|............... ]
-// Until the writers complete their tickets, any reader's pointer will stay at zero, and readers will
+//                 Ticket A | Ticket B | No active tickets
+// Ring buffer: [ XXXX......|XXXXX.....|............... ]
+//                ^tail                ^head
+// (Ticket A owned by Thread A, and Ticket B owned by Thread B)
+//
+// Until the writers complete their tickets, tail will remain at 0, and readers will
 // be unable to read the data until finalized.
 //
-// Now Writer B finishes writing its data and sends the ticket:
-//                 Writer A | Writer B | No active tickets
-// Ring buffer: [ XXXXX.....|XXXXXXXXXX|............... ]
-// Like a normal ring buffer, we advance the write pointer when data is finished being written.
+// Now Thread B finishes writing its data and sends the ticket:
+//                 Ticket A | Ticket B | No active tickets
+// Ring buffer: [ XXXXXX....|XXXXXXXXXX|............... ]
+//                ^tail                ^head
+//
+// Like a normal ring buffer, we want to advance the write pointer when data is finished being written.
 // If we naively do this in the situation presented above, the readers will break aliasing rules by
-// reading Writer A's partially complete write.
+// reading Thread A's partially complete write.
 //
-// We could use a channel to get around this, by sending the finished range to readers, and only
-// using the ring buffer's points for allocating chunks in `try_reserve` and keeping the readers
-// separate from the writers, but this feels unsatisfying.
+// The solution is to use a channel between the readers and the writers. Once any writer is done
+// with a ticket, we send it over the channel, letting a reader read the ticket's bytes
+// immediately.
+// Once the reader is done with a ticket, it tries to advance tail (to unblock the writer), but
+// in the example above, we can only advance tail if Ticket A is received first.
 //
-// EDIT: I will do the channel implementation first since its simpler, then bench / evaluate
-// against a more proper implementation once I can solve this problem. The channel solution also
-// has a similar problem when packets are finished being read in a different out of order. We have
-// to maintain a list of pending packets that will be handled once packets before it are finished
-// being read
+// Therefore, we store information about Ticket B into a VecDeque shared by the readers. Once
+// Ticket A is done being read, we will find Ticket B in this list and free both A and B at the
+// same time, allowing us to advance tail, giving more space to the writer.
+//
+// After Ticket B is released by a reader:
+//                                     | Ticket C | ...
+// Ring buffer: [ .....................|............... ]
+//                                     ^head
+//                                     ^tail
+// Now the writer(s) have the entire buffer to use
