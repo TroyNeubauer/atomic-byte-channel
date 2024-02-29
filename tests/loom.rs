@@ -23,7 +23,7 @@ where
 fn concurrent_1() {
     let mut i = 0;
     let bytes_of_bytes: &'static Vec<Vec<u8>> = Box::leak(Box::new(
-        (0..2)
+        (0..3)
             .map(|_| {
                 (0..8)
                     .map(|_| {
@@ -42,6 +42,7 @@ fn concurrent_1() {
             for (bytes2, bytes) in bytes_of_bytes.iter().zip(r.iter()) {
                 assert_eq!(bytes.bytes(), bytes2);
             }
+            println!("DONE");
         });
 
         for bytes in bytes_of_bytes {

@@ -399,8 +399,22 @@ pub struct ReaderIterator<'a> {
 impl<'a> Iterator for ReaderIterator<'a> {
     type Item = PacketHandle<'a>;
 
+    #[cfg(not(loom))]
     fn next(&mut self) -> Option<Self::Item> {
         let ticket = self.reader.ticket_rx.recv().ok()?;
+        Some(self.reader.handle_recv(ticket))
+    }
+
+    #[cfg(loom)]
+    fn next(&mut self) -> Option<Self::Item> {
+        let ticket = loop {
+            // blocking recv deadlocks under loom since the model doesn't know were blocked on
+            // another thread for progress
+            match self.reader.ticket_rx.try_recv() {
+                Ok(t) => break t,
+                Err(_) => loom::hint::spin_loop(),
+            }
+        };
         Some(self.reader.handle_recv(ticket))
     }
 }
