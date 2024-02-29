@@ -21,9 +21,9 @@ pub mod prelude {
     #[cfg(not(loom))]
     pub(crate) mod atomic {
         #[cfg(not(feature = "std"))]
-        pub use alloc::vec::Vec;
+        pub use alloc::{vec::Vec, collections::VecDeque};
         #[cfg(feature = "std")]
-        pub use std::vec::Vec;
+        pub use std::{vec::Vec, collections::VecDeque};
 
         pub(crate) use core::sync::atomic::{AtomicBool, AtomicUsize};
     }
@@ -40,8 +40,6 @@ pub mod prelude {
 }
 
 use prelude::*;
-
-use std::collections::VecDeque;
 
 // TODO: switch to our own
 // tokio has a decent one for what we need, so just use that for now
@@ -194,7 +192,7 @@ impl Writer {
             // 1. Readers never read bytes
             // 2. We exchanged `head` with `new_head` atomically, giving unique access to `len` bytes
             //    starting at `offest`
-            let buf = unsafe { std::slice::from_raw_parts_mut(start, len) };
+            let buf = unsafe { core::slice::from_raw_parts_mut(start, len) };
 
             break Some(Ticket {
                 buf: ReadBuf::new(buf),
@@ -263,7 +261,7 @@ impl Reader {
 
         // SAFETY: We have received a finalized ticket from a writer, indicating that we have
         // exclusive access to the range ticket.offset..(ticket.offset + ticket.len)
-        let buf = unsafe { std::slice::from_raw_parts(start, ticket.len) };
+        let buf = unsafe { core::slice::from_raw_parts(start, ticket.len) };
         PacketHandle {
             buf,
             ticket,
@@ -367,7 +365,7 @@ impl PacketHandle<'_> {
     }
 }
 
-impl<'a> std::ops::Deref for PacketHandle<'a> {
+impl<'a> core::ops::Deref for PacketHandle<'a> {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
@@ -431,7 +429,7 @@ pub struct Ticket<'a> {
     alloc_end: usize,
 }
 
-impl<'a> std::ops::Deref for Ticket<'a> {
+impl<'a> core::ops::Deref for Ticket<'a> {
     type Target = ReadBuf<'a>;
 
     fn deref(&self) -> &Self::Target {
@@ -439,7 +437,7 @@ impl<'a> std::ops::Deref for Ticket<'a> {
     }
 }
 
-impl<'a> std::ops::DerefMut for Ticket<'a> {
+impl<'a> core::ops::DerefMut for Ticket<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.buf
     }
