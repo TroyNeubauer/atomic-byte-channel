@@ -152,20 +152,20 @@ impl Writer {
             // Wraparound to front of buffer we don't have `len` bytes before the end of the buffer
             let wraparound = self.index(head) + len > self.buf.len();
 
-            //println!("try_reserve: head: {head}, tail: {tail}, len: {len}");
+            println!("try_reserve: head: {head}, tail: {tail}, len: {len}");
             if wraparound {
                 // don't step on reader(s)
                 if len > self.index(tail) {
                     // Not enough space at front of buffer
-                    //println!("Not enough space at front of buffer");
+                    println!("Not enough space at front of buffer");
                     return None;
                 }
-                //println!("using wraparound");
+                println!("using wraparound");
             } else {
                 // don't step on reader(s)
                 let end = head + len;
                 if end > tail + self.buf.len() {
-                    //println!("Allocate wouldn't fit (without wraparound)");
+                    println!("Allocate wouldn't fit (without wraparound)");
                     return None;
                 }
             }
@@ -191,13 +191,15 @@ impl Writer {
             };
 
             let idx = self.index(new_head - len);
-            //println!(
-            //   "try_reserve: head {offset} -> {new_head}, making indices {}..{} available to writer",
-            //   idx,
-            //   idx + len
-            //);
+            println!(
+               "try_reserve: head {offset} -> {new_head}, making indices {}..{} available to writer",
+               idx,
+               idx + len
+            );
 
-            let start = self.buf[idx].get();
+            // SAFETY: TODO
+            let start: *const UnsafeCell<u8> = unsafe { self.buf.as_ptr().offset(idx as isize) };
+            let start = unsafe { (&*start).get() };
 
             // SAFETY:
             // 1. Readers never read bytes
@@ -221,7 +223,7 @@ impl Writer {
             panic!("Ticket not completely filled with data! Reserved {capacity} bytes, but user only wrote {filled} bytes");
         }
 
-        //println!("Buffered tickets: {}", self.ticket_tx.len());
+        println!("Buffered tickets: {}", self.ticket_tx.len());
         self.ticket_tx
             .try_send(FinalizedTicket {
                 alloc_start: ticket.alloc_start,
@@ -284,7 +286,7 @@ impl Reader {
         }
 
         if let Some(mut pending) = self.pending_handles.try_lock() {
-            //println!("{} tickets remain unhandled", pending.len());
+            println!("{} tickets remain unhandled", pending.len());
 
             // Tickets sorted, so if we are unable to cleanup one, we will be unable to cleanup
             // anything after it
@@ -313,13 +315,13 @@ impl Reader {
 
         pending.insert(insert_index, ticket.clone());
         self.pending_empty.store(false, Ordering::Release);
-        //println!("Cant handle ticket currently. Cleaning {ticket:?} later tail: {tail}, pending: {pending:?}");
+        println!("Cant handle ticket currently. Cleaning {ticket:?} pending: {pending:?}");
     }
 
     pub(crate) fn try_cleanup_ticket<'a>(&'a self, ticket: &FinalizedTicket) -> Result<(), ()> {
         let tail = self.shared.tail.load(Ordering::Acquire);
 
-        //println!("Reader trying to cleanup {ticket:?}");
+        println!("Reader trying to cleanup {ticket:?}");
         if ticket.alloc_start > tail {
             return Err(());
         }
@@ -332,10 +334,10 @@ impl Reader {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    //println!(
-                    //    "Reader handled ticket {ticket:?}, tail: {} -> {}",
-                    //    ticket.alloc_start, ticket.alloc_end
-                    //);
+                    println!(
+                        "Reader handled ticket {ticket:?}, tail: {} -> {}",
+                        ticket.alloc_start, ticket.alloc_end
+                    );
                     break Ok(());
                 }
                 Err(actual_tail) => {
