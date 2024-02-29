@@ -45,7 +45,7 @@ jobs:
         env:
           LSAN_OPTIONS: "suppressions=lsan-suppressions.txt"
           RUSTFLAGS: "-Z sanitizer=leak"
-  # TODO: re-enable. See: ???
+  # TODO: re-enable. See: https://github.com/TroyNeubauer/atomic-byte-channel/blob/a6ce7d51e20b3acdea9e680b525a6956389a13e2/src/lib.rs#L187-L200
   # miri:
   #   runs-on: ubuntu-latest
   #   steps:
