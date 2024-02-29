@@ -6,16 +6,11 @@
 //! 2. Multi threaded linker wants to create two separate sections in the same elf file that can be
 //!    written to in parallel
 
-#[cfg(not(features = "std"))]
+#[cfg(not(feature = "std"))]
 extern crate alloc;
 
 pub mod prelude {
-    pub(crate) use core::{
-        cell::UnsafeCell,
-        fmt::{Debug},
-        sync::atomic::Ordering,
-    };
-    
+    pub(crate) use core::{cell::UnsafeCell, fmt::Debug, sync::atomic::Ordering};
 
     #[cfg(loom)]
     pub(crate) mod atomic {
@@ -30,7 +25,6 @@ pub mod prelude {
         #[cfg(feature = "std")]
         pub use std::vec::Vec;
 
-        
         pub(crate) use core::sync::atomic::{AtomicBool, AtomicUsize};
     }
 
@@ -249,6 +243,8 @@ pub struct Reader {
 }
 
 impl Reader {
+    // TODO: fix
+    #[allow(clippy::result_unit_err)]
     pub fn try_recv(&self) -> Result<PacketHandle<'_>, ()> {
         Ok(self.handle_recv(self.ticket_rx.try_recv().map_err(|_| ())?))
     }
