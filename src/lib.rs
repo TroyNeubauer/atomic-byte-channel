@@ -4,7 +4,7 @@
 //! 1. One thread continuously generates IPV4 packets that are sent to multiple worker I/O threads
 //!    for better throughput
 //! 2. Multi threaded linker wants to create two separate sections in the same elf file that can be
-//!    written to in parallel
+//!    written to in parallel. TODO: api to "take" entire buffer if all writers are gone
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -14,8 +14,9 @@ pub mod prelude {
 
     #[cfg(loom)]
     pub(crate) mod atomic {
-        pub(crate) use atomic_waker::AtomicWaker;
-        pub(crate) use loom::sync::atomic::{fence, AtomicBool, AtomicU8, AtomicUsize};
+        pub use atomic_waker::AtomicWaker;
+        pub use loom::sync::atomic::{fence, AtomicBool, AtomicU8, AtomicUsize};
+        pub use std::{collections::VecDeque, vec::Vec};
     }
 
     #[cfg(not(loom))]
@@ -25,14 +26,14 @@ pub mod prelude {
         #[cfg(feature = "std")]
         pub use std::{collections::VecDeque, vec::Vec};
 
-        pub(crate) use core::sync::atomic::{AtomicBool, AtomicUsize};
+        pub use core::sync::atomic::{AtomicBool, AtomicUsize};
     }
 
-    // Use std'd Arc even when under loom
+    // Use std's Arc even when under loom
     #[cfg(not(feature = "std"))]
-    pub use alloc::sync::Arc;
+    pub(crate) use alloc::sync::Arc;
     #[cfg(feature = "std")]
-    pub use std::sync::Arc;
+    pub(crate) use std::sync::Arc;
 
     pub(crate) use atomic::*;
 
@@ -41,8 +42,9 @@ pub mod prelude {
 
 use prelude::*;
 
-// TODO: switch to our own
-// tokio has a decent one for what we need, so just use that for now
+// TODO: switch to our own (want sync and async api on same struct, plus crossbeam currently
+// doesn't support no_std)
+// crossbeam has a decent one for what we need, so just use that for now
 use crossbeam_channel::{Receiver, Sender};
 use crossbeam_utils::CachePadded;
 use parking_lot::Mutex;
