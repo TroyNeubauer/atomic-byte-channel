@@ -31,7 +31,7 @@ fn recv_out_of_order() {
         .iter()
         .map(|bytes| {
             let mut t = w.try_reserve(chunk_len).unwrap();
-            t.initialize_unfilled().copy_from_slice(&bytes);
+            t.initialize_unfilled().copy_from_slice(bytes);
             t.set_filled(bytes.len());
 
             t

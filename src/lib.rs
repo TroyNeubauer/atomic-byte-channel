@@ -12,15 +12,10 @@ extern crate alloc;
 pub mod prelude {
     pub(crate) use core::{
         cell::UnsafeCell,
-        fmt::{self, Debug},
-        future::Future,
-        mem::MaybeUninit,
-        pin::Pin,
-        ptr,
+        fmt::{Debug},
         sync::atomic::Ordering,
-        task::{Context, Poll, Waker},
     };
-    pub(crate) use futures_core::ready;
+    
 
     #[cfg(loom)]
     pub(crate) mod atomic {
@@ -35,8 +30,8 @@ pub mod prelude {
         #[cfg(feature = "std")]
         pub use std::vec::Vec;
 
-        pub(crate) use atomic_waker::AtomicWaker;
-        pub(crate) use core::sync::atomic::{fence, AtomicBool, AtomicU8, AtomicUsize};
+        
+        pub(crate) use core::sync::atomic::{AtomicBool, AtomicUsize};
     }
 
     // Use std'd Arc even when under loom
@@ -144,7 +139,7 @@ fn next_mutiple(n: usize, base: usize) -> usize {
 
 impl Writer {
     /// Tries to reserve a
-    pub fn try_reserve<'a>(&'a self, len: usize) -> Option<Ticket<'a>> {
+    pub fn try_reserve(&self, len: usize) -> Option<Ticket<'_>> {
         let mut head = self.shared.head.load(Ordering::Acquire);
         loop {
             let tail = self.shared.tail.load(Ordering::Acquire);
@@ -198,8 +193,8 @@ impl Writer {
             );
 
             // SAFETY: TODO
-            let start: *const UnsafeCell<u8> = unsafe { self.buf.as_ptr().offset(idx as isize) };
-            let start = unsafe { (&*start).get() };
+            let start: *const UnsafeCell<u8> = unsafe { self.buf.as_ptr().add(idx) };
+            let start = unsafe { (*start).get() };
 
             // SAFETY:
             // 1. Readers never read bytes
@@ -254,11 +249,11 @@ pub struct Reader {
 }
 
 impl Reader {
-    pub fn try_recv<'a>(&'a self) -> Result<PacketHandle<'a>, ()> {
+    pub fn try_recv(&self) -> Result<PacketHandle<'_>, ()> {
         Ok(self.handle_recv(self.ticket_rx.try_recv().map_err(|_| ())?))
     }
 
-    pub(crate) fn handle_recv<'a>(&'a self, ticket: FinalizedTicket) -> PacketHandle<'a> {
+    pub(crate) fn handle_recv(&self, ticket: FinalizedTicket) -> PacketHandle<'_> {
         self.try_run_cleanup();
 
         let wraparound = ticket.alloc_end - ticket.len != ticket.alloc_start;
@@ -318,7 +313,7 @@ impl Reader {
         println!("Cant handle ticket currently. Cleaning {ticket:?} pending: {pending:?}");
     }
 
-    pub(crate) fn try_cleanup_ticket<'a>(&'a self, ticket: &FinalizedTicket) -> Result<(), ()> {
+    pub(crate) fn try_cleanup_ticket(&self, ticket: &FinalizedTicket) -> Result<(), ()> {
         let tail = self.shared.tail.load(Ordering::Acquire);
 
         println!("Reader trying to cleanup {ticket:?}");
@@ -326,27 +321,25 @@ impl Reader {
             return Err(());
         }
 
-        loop {
-            match self.shared.tail.compare_exchange_weak(
-                ticket.alloc_start,
-                ticket.alloc_end,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    println!(
-                        "Reader handled ticket {ticket:?}, tail: {} -> {}",
-                        ticket.alloc_start, ticket.alloc_end
-                    );
-                    break Ok(());
-                }
-                Err(actual_tail) => {
-                    // Either:
-                    // ticket.offset > tail (handled above)
-                    // ticket.offset == tail, leads to Ok branch
-                    // Nobody else can increment tail if tail equals our ticket's offset
-                    unreachable!("Reader failed to increment tail after ticket recv. Read section {}..{}, but tail was actually {actual_tail}", ticket.alloc_start, ticket.alloc_end)
-                }
+        match self.shared.tail.compare_exchange_weak(
+            ticket.alloc_start,
+            ticket.alloc_end,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                println!(
+                    "Reader handled ticket {ticket:?}, tail: {} -> {}",
+                    ticket.alloc_start, ticket.alloc_end
+                );
+                Ok(())
+            }
+            Err(actual_tail) => {
+                // Either:
+                // ticket.offset > tail (handled above)
+                // ticket.offset == tail, leads to Ok branch
+                // Nobody else can increment tail if tail equals our ticket's offset
+                unreachable!("Reader failed to increment tail after ticket recv. Read section {}..{}, but tail was actually {actual_tail}", ticket.alloc_start, ticket.alloc_end)
             }
         }
     }
@@ -355,7 +348,7 @@ impl Reader {
         offset % self.buf.len()
     }
 
-    pub fn iter<'a>(&'a self) -> ReaderIterator<'a> {
+    pub fn iter(&self) -> ReaderIterator<'_> {
         ReaderIterator { reader: self }
     }
 }
