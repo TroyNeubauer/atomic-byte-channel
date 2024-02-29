@@ -184,15 +184,18 @@ impl Writer {
                idx + len
             );
 
-            // SAFETY: TODO
+            // SAFETY:
+            // 1. Readers never read beyond `head`
+            // 2. We atomically exchanged `head` with `new_head` atomically, giving unique access to
+            //    the range `head..new_head`
             let start: *const UnsafeCell<u8> = unsafe { self.buf.as_ptr().add(idx) };
+            // NOTE: currently this fails under miri since we are only creating a stacked borrow at
+            // `buf[0]`, and not `buf[..]`. We need an api to turn &[UnsafeCell<T>] -> &[T] to
+            // inform miri we are creating Unique borrows of all elements in `buf`, however this
+            // doesn't currently exist. TODO: open pr in rust-lang/rust and maybe miri
             let start = unsafe { (*start).get() };
 
-            // SAFETY:
-            // 1. Readers never read bytes
-            // 2. We exchanged `head` with `new_head` atomically, giving unique access to `len` bytes
-            //    starting at `offest`
-            let buf = unsafe { core::slice::from_raw_parts_mut(start, len) };
+            let buf = unsafe { core::slice::from_pt(start, len) };
 
             break Some(Ticket {
                 buf: ReadBuf::new(buf),
