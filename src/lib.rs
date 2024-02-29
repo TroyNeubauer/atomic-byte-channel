@@ -21,9 +21,9 @@ pub mod prelude {
     #[cfg(not(loom))]
     pub(crate) mod atomic {
         #[cfg(not(feature = "std"))]
-        pub use alloc::{vec::Vec, collections::VecDeque};
+        pub use alloc::{collections::VecDeque, vec::Vec};
         #[cfg(feature = "std")]
-        pub use std::{vec::Vec, collections::VecDeque};
+        pub use std::{collections::VecDeque, vec::Vec};
 
         pub(crate) use core::sync::atomic::{AtomicBool, AtomicUsize};
     }
@@ -195,7 +195,9 @@ impl Writer {
             // doesn't currently exist. TODO: open pr in rust-lang/rust and maybe miri
             let start = unsafe { (*start).get() };
 
-            let buf = unsafe { core::slice::from_pt(start, len) };
+            // TODO: we also likely want to use `slice::slice_from_ptr_range`,
+            // But this is currently unstable https://github.com/rust-lang/rust/issues/89792
+            let buf = unsafe { core::slice::from_raw_parts_mut(start, len) };
 
             break Some(Ticket {
                 buf: ReadBuf::new(buf),
