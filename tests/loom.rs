@@ -54,12 +54,15 @@ fn concurrent_1() {
                 }
             };
             ticket.initialize_unfilled().copy_from_slice(&bytes);
+            println!("cap: {}", ticket.capacity());
             ticket.set_filled(bytes.len());
+            println!("filled: {}", ticket.filled().len());
 
             loop {
                 match w.finalize_ticket(ticket) {
                     Ok(()) => break,
                     Err(t) => {
+                        println!("Writer failed to finalize ticket - internal buffer out of space");
                         loom::hint::spin_loop();
                         ticket = t
                     }

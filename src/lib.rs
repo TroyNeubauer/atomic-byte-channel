@@ -6,6 +6,8 @@
 //! 2. Multi threaded linker wants to create two separate sections in the same elf file that can be
 //!    written to in parallel. TODO: api to "take" entire buffer if all writers are gone
 
+#![deny(unsafe_op_in_unsafe_fn)]
+
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
@@ -135,6 +137,14 @@ impl Writer {
     /// Tries to reserve a
     pub fn try_reserve(&self, len: usize) -> Option<Ticket<'_>> {
         let mut head = self.shared.head.load(Ordering::Acquire);
+        if len == 0 {
+            return Some(Ticket {
+                buf: ReadBuf::new(&mut []),
+                alloc_start: head,
+                alloc_end: head,
+            });
+        }
+
         loop {
             let tail = self.shared.tail.load(Ordering::Acquire);
 
@@ -188,18 +198,10 @@ impl Writer {
 
             // SAFETY:
             // 1. Readers never read beyond `head`
-            // 2. We atomically exchanged `head` with `new_head` atomically, giving unique access to
-            //    the range `head..new_head`
-            let start: *const UnsafeCell<u8> = unsafe { self.buf.as_ptr().add(idx) };
-            // NOTE: currently this fails under miri since we are only creating a stacked borrow at
-            // `buf[0]`, and not `buf[..]`. We need an api to turn &[UnsafeCell<T>] -> &[T] to
-            // inform miri we are creating Unique borrows of all elements in `buf`, however this
-            // doesn't currently exist. TODO: open pr in rust-lang/rust and maybe miri
-            let start = unsafe { (*start).get() };
-
-            // TODO: we also likely want to use `slice::slice_from_ptr_range`,
-            // But this is currently unstable https://github.com/rust-lang/rust/issues/89792
-            let buf = unsafe { core::slice::from_raw_parts_mut(start, len) };
+            // 2. We replaced `head` with `new_head` atomically, giving unique access to the range
+            //   `head..new_head`
+            // 3. `len` is non zero by the check above
+            let buf = unsafe { tag_raw_parts_mut(&self.buf, idx, len) };
 
             break Some(Ticket {
                 buf: ReadBuf::new(buf),
@@ -212,24 +214,100 @@ impl Writer {
     pub fn finalize_ticket<'a>(&'a self, ticket: Ticket<'a>) -> Result<(), Ticket<'a>> {
         let filled = ticket.buf.filled().len();
         let capacity = ticket.buf.capacity();
+        dbg!(filled, capacity);
         // TODO: do we want to support the user changing the length?
         if filled != capacity {
             panic!("Ticket not completely filled with data! Reserved {capacity} bytes, but user only wrote {filled} bytes");
         }
+        let finalized = FinalizedTicket {
+            alloc_start: ticket.alloc_start,
+            len: ticket.buf.capacity(),
+            alloc_end: ticket.alloc_end,
+        };
 
+        let filled = ticket.filled().len();
         println!("Buffered tickets: {}", self.ticket_tx.len());
-        self.ticket_tx
-            .try_send(FinalizedTicket {
-                alloc_start: ticket.alloc_start,
-                len: ticket.buf.capacity(),
-                alloc_end: ticket.alloc_end,
-            })
-            .map_err(|_| ticket)
+        // XXX: make miri happy
+        drop(ticket);
+
+        self.ticket_tx.try_send(finalized.clone()).map_err(|_| {
+            let alloc_start = finalized.alloc_start;
+            let len = finalized.alloc_end - finalized.alloc_start;
+
+            // SAFETY:
+            // We never gave up our access to `ticket` since the send failed.
+            // Therefore we still have exclusive access to the same range
+            let buf = unsafe { tag_raw_parts_mut(&self.buf, self.index(alloc_start), len) };
+
+            let mut buf = ReadBuf::new(buf);
+            buf.set_filled(filled);
+            Ticket {
+                buf,
+                alloc_start,
+                alloc_end: finalized.alloc_end,
+            }
+        })
     }
 
     pub(crate) fn index(&self, offset: usize) -> usize {
         offset % self.buf.len()
     }
+}
+
+/// Returns a mutable slice of `buf[offset..offset+len]`.
+///
+/// SAFETY:
+/// 1. The caller must guarantee exclusive access to `buf[offset..offset+len]` for 'r
+/// 2. `len` must not be zero
+unsafe fn tag_raw_parts_mut<'b, 'r>(
+    buf: &'b [UnsafeCell<u8>],
+    offset: usize,
+    len: usize,
+) -> &'r mut [u8]
+where
+    'r: 'b,
+{
+    let mut ptrs = (0..len).map(|i| {
+        // SAFETY: The caller guaranteed that we have exclusive access to `buf[offset..offset+len]`
+        let ptr = unsafe { buf.as_ptr().add(offset + i) };
+        UnsafeCell::raw_get(ptr)
+    });
+    // SAFETY: The caller guaranteed that len is non zero (ptrs produces at least one value)
+    let start = unsafe { ptrs.next().unwrap_unchecked() };
+
+    // Traverse subslice to force miri to tag all elements
+    // In release mode this is optimized out
+    let _ = ptrs.last();
+
+    // SAFETY: the caller guaranteed that we have `buf[offset..offset+len]` (`start[0..len]`)
+    unsafe { core::slice::from_raw_parts_mut(start, len) }
+}
+
+/// Returns a mutable slice of `buf[offset..offset+len]`.
+///
+/// SAFETY:
+/// 1. The caller must guarantee that the range `buf[offset..offset+len]` will not be mutated for
+///    the duration of 'r
+/// 2. `len` must not be zero
+unsafe fn tag_raw_parts<'b, 'r>(buf: &'b [UnsafeCell<u8>], offset: usize, len: usize) -> &'r [u8]
+where
+    'r: 'b,
+{
+    let mut ptrs = (0..len).map(|i| {
+        // SAFETY: The caller guaranteed that we have exclusive access to `buf[offset..offset+len]`
+        let ptr: *const UnsafeCell<u8> = unsafe { buf.as_ptr().add(offset + i) };
+        // `UnsafeCell<u8>` has the same layout as `u8`
+        ptr as *const u8
+    });
+    // SAFETY: The caller guaranteed that len is non zero (ptrs produces at least one value)
+    let start = unsafe { ptrs.next().unwrap_unchecked() };
+
+    // Traverse subslice to force miri to tag all elements
+    // In release mode this is optimized out
+    let _ = ptrs.last();
+
+    // SAFETY: the caller guaranteed that we have `buf[offset..offset+len]` (`start[0..len]`)
+    unsafe { core::slice::from_raw_parts(start, len) }
 }
 
 unsafe impl Send for Reader {}
@@ -257,6 +335,14 @@ impl Reader {
     pub(crate) fn handle_recv(&self, ticket: FinalizedTicket) -> PacketHandle<'_> {
         self.try_run_cleanup();
 
+        if ticket.len == 0 {
+            return PacketHandle {
+                buf: &[],
+                ticket,
+                reader: self,
+            };
+        }
+
         let wraparound = ticket.alloc_end - ticket.len != ticket.alloc_start;
         let idx = if wraparound {
             debug_assert!(self.index(ticket.alloc_end) == ticket.len);
@@ -264,11 +350,10 @@ impl Reader {
         } else {
             self.index(ticket.alloc_end - ticket.len)
         };
-        let start: *const u8 = self.buf[idx].get();
 
         // SAFETY: We have received a finalized ticket from a writer, indicating that we have
         // exclusive access to the range ticket.offset..(ticket.offset + ticket.len)
-        let buf = unsafe { core::slice::from_raw_parts(start, ticket.len) };
+        let buf = unsafe { tag_raw_parts(&self.buf, idx, ticket.len) };
         PacketHandle {
             buf,
             ticket,
@@ -322,7 +407,7 @@ impl Reader {
             return Err(());
         }
 
-        match self.shared.tail.compare_exchange_weak(
+        match self.shared.tail.compare_exchange(
             ticket.alloc_start,
             ticket.alloc_end,
             Ordering::AcqRel,
