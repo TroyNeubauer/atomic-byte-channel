@@ -219,34 +219,16 @@ impl Writer {
         if filled != capacity {
             panic!("Ticket not completely filled with data! Reserved {capacity} bytes, but user only wrote {filled} bytes");
         }
-        let finalized = FinalizedTicket {
-            alloc_start: ticket.alloc_start,
-            len: ticket.buf.capacity(),
-            alloc_end: ticket.alloc_end,
-        };
 
-        let filled = ticket.filled().len();
         println!("Buffered tickets: {}", self.ticket_tx.len());
-        // XXX: make miri happy
-        drop(ticket);
 
-        self.ticket_tx.try_send(finalized.clone()).map_err(|_| {
-            let alloc_start = finalized.alloc_start;
-            let len = finalized.alloc_end - finalized.alloc_start;
-
-            // SAFETY:
-            // We never gave up our access to `ticket` since the send failed.
-            // Therefore we still have exclusive access to the same range
-            let buf = unsafe { tag_raw_parts_mut(&self.buf, self.index(alloc_start), len) };
-
-            let mut buf = ReadBuf::new(buf);
-            buf.set_filled(filled);
-            Ticket {
-                buf,
-                alloc_start,
-                alloc_end: finalized.alloc_end,
-            }
-        })
+        self.ticket_tx
+            .try_send(FinalizedTicket {
+                alloc_start: ticket.alloc_start,
+                len: ticket.buf.capacity(),
+                alloc_end: ticket.alloc_end,
+            })
+            .map_err(|_| ticket)
     }
 
     pub(crate) fn index(&self, offset: usize) -> usize {
